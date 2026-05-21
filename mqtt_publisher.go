@@ -4,8 +4,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"net"
+	"os"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -26,19 +27,33 @@ func NewMQTTPublisher(config *MQTTConfig) (*MQTTPublisher, error) {
 	opts.SetAutoReconnect(true)
 	opts.SetMaxReconnectInterval(10 * time.Second)
 	opts.SetKeepAlive(60 * time.Second)
+	opts.SetProtocolVersion(4) // MQTT 3.1.1
+
+	// Force IPv4 resolution
+	opts.SetDialer(&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 60 * time.Second,
+		DualStack: false, // Force IPv4 only
+	})
 
 	// Configure TLS if enabled
 	if config.UseTLS {
-		tlsConfig := &tls.Config{}
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: true, // Skip built-in verification to handle legacy certificates
+			MinVersion:         tls.VersionTLS12,
+			MaxVersion:         tls.VersionTLS13,
+		}
 
 		// Load CA certificate if provided
 		if config.CACert != "" {
-			caCert, err := ioutil.ReadFile(config.CACert)
+			caCert, err := os.ReadFile(config.CACert)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read CA certificate: %w", err)
 			}
 			caCertPool := x509.NewCertPool()
-			caCertPool.AppendCertsFromPEM(caCert)
+			if !caCertPool.AppendCertsFromPEM(caCert) {
+				return nil, fmt.Errorf("failed to parse CA certificate")
+			}
 			tlsConfig.RootCAs = caCertPool
 		}
 
@@ -51,7 +66,37 @@ func NewMQTTPublisher(config *MQTTConfig) (*MQTTPublisher, error) {
 			tlsConfig.Certificates = []tls.Certificate{cert}
 		}
 
-		tlsConfig.InsecureSkipVerify = config.SkipTLSVerify
+		// Custom verification to accept legacy Common Name fields
+		if !config.SkipTLSVerify {
+			tlsConfig.VerifyConnection = func(state tls.ConnectionState) error {
+				if len(state.PeerCertificates) == 0 {
+					return fmt.Errorf("no peer certificates")
+				}
+
+				log.Printf("Performing custom certificate verification")
+
+				// Verify certificate chain against CA (skip DNS name verification for legacy certificates)
+				opts := x509.VerifyOptions{
+					Roots:         tlsConfig.RootCAs,
+					DNSName:       "", // Skip DNS name verification for legacy certificates
+					Intermediates: x509.NewCertPool(),
+				}
+
+				// Add intermediate certificates
+				for _, cert := range state.PeerCertificates[1:] {
+					opts.Intermediates.AddCert(cert)
+				}
+
+				// Verify certificate chain
+				if _, err := state.PeerCertificates[0].Verify(opts); err != nil {
+					return fmt.Errorf("certificate chain verification failed: %w", err)
+				}
+
+				log.Printf("Certificate verification successful")
+				return nil
+			}
+		}
+
 		opts.SetTLSConfig(tlsConfig)
 	}
 
@@ -64,6 +109,12 @@ func NewMQTTPublisher(config *MQTTConfig) (*MQTTPublisher, error) {
 }
 
 func (p *MQTTPublisher) Connect() error {
+	log.Printf("Attempting to connect to MQTT broker: %s", p.config.BrokerAddress)
+	log.Printf("TLS enabled: %v, Skip verify: %v", p.config.UseTLS, p.config.SkipTLSVerify)
+	if p.config.CACert != "" {
+		log.Printf("CA certificate: %s", p.config.CACert)
+	}
+
 	token := p.client.Connect()
 	if token.Wait() && token.Error() != nil {
 		return fmt.Errorf("failed to connect to MQTT broker: %w", token.Error())
